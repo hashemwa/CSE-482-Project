@@ -344,6 +344,49 @@ def preprocess_for_prediction(text):
     
     return result
 
+def detect_text_column(columns):
+    preferred_columns = ['review_text', 'tweet', 'text', 'content', 'message', 'body']
+    normalized_columns = {column.lower().strip(): column for column in columns}
+
+    for column in preferred_columns:
+        if column in normalized_columns:
+            return normalized_columns[column]
+
+    for column in columns:
+        normalized = column.lower().strip()
+        if 'tweet' in normalized or 'text' in normalized:
+            return column
+
+    return None
+
+def build_batch_predictions(input_df, text_column, model_data):
+    output_df = input_df.copy()
+    raw_text = output_df[text_column].fillna('').astype(str)
+    cleaned_text = raw_text.apply(preprocess_for_prediction)
+    valid_mask = cleaned_text.str.len() > 0
+
+    output_df['cleaned_text'] = cleaned_text
+    output_df['predicted_sentiment'] = ''
+
+    if not valid_mask.any():
+        return output_df, valid_mask
+
+    vectorizer = model_data['vectorizer']
+    model = model_data['model']
+    X_batch = vectorizer.transform(cleaned_text[valid_mask])
+    predictions = model.predict(X_batch)
+    output_df.loc[valid_mask, 'predicted_sentiment'] = [
+        'Positive' if prediction == 1 else 'Negative'
+        for prediction in predictions
+    ]
+
+    if hasattr(model, 'predict_proba'):
+        probabilities = model.predict_proba(X_batch)
+        output_df.loc[valid_mask, 'negative_probability'] = probabilities[:, 0]
+        output_df.loc[valid_mask, 'positive_probability'] = probabilities[:, 1]
+
+    return output_df, valid_mask
+
 # ============== Main App ==============
 def main():
     # Header
@@ -370,13 +413,14 @@ def main():
         top_n = st.slider("Top N words to display", 10, 30, 20)
     
     # Main tabs
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         ":material/monitoring: Overview", 
         ":material/text_fields: Word Analysis", 
         ":material/smart_toy: Model Comparison", 
         ":material/functions: Math & ROC", 
         ":material/target: Live Prediction", 
-        ":material/table_view: Data Explorer"
+        ":material/table_view: Data Explorer",
+        ":material/upload_file: Batch Prediction"
     ])
     
     # ============== Tab 1: Overview ==============
@@ -812,6 +856,59 @@ def main():
             mime="text/csv",
             icon=":material/download:"
         )
+
+    # ============== Tab 7: Batch Prediction ==============
+    with tab7:
+        st.header("Batch Sentiment Prediction", anchor=False)
+        st.markdown("Upload a CSV of tweets or reviews and score every non-empty text row.")
+
+        with st.spinner("Loading models..."):
+            models = train_models(df)
+
+        batch_model_choice = st.selectbox(
+            "Select Batch Model:",
+            list(models.keys()),
+            key="batch_model_choice"
+        )
+        uploaded_file = st.file_uploader("Upload CSV file:", type=["csv"])
+
+        if uploaded_file is not None:
+            try:
+                input_df = pd.read_csv(uploaded_file)
+            except Exception as exc:
+                st.error(f"Could not read CSV file: {exc}")
+                input_df = None
+
+            if input_df is not None:
+                if input_df.empty:
+                    st.warning("The uploaded CSV has no rows.")
+                else:
+                    detected_column = detect_text_column(input_df.columns)
+                    column_options = list(input_df.columns)
+                    default_index = column_options.index(detected_column) if detected_column in column_options else 0
+                    text_column = st.selectbox(
+                        "Text column:",
+                        column_options,
+                        index=default_index
+                    )
+
+                    results_df, valid_mask = build_batch_predictions(
+                        input_df,
+                        text_column,
+                        models[batch_model_choice]
+                    )
+
+                    st.metric("Rows Scored", int(valid_mask.sum()))
+                    st.dataframe(results_df, use_container_width=True, hide_index=True)
+
+                    csv_results = results_df.to_csv(index=False)
+                    st.download_button(
+                        label="Download Predictions as CSV",
+                        data=csv_results,
+                        file_name="batch_sentiment_predictions.csv",
+                        mime="text/csv",
+                        icon=":material/download:"
+                    )
 
 if __name__ == "__main__":
     main()
