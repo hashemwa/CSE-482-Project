@@ -17,6 +17,9 @@ from sklearn.naive_bayes import MultinomialNB
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_curve, roc_auc_score, f1_score, precision_recall_curve
 from scipy.sparse import hstack
 import warnings
+
+from batch_sources import detect_text_column, fetch_xquik_posts
+
 warnings.filterwarnings('ignore')
 
 # Mathematical formulations as markdown
@@ -344,22 +347,8 @@ def preprocess_for_prediction(text):
     
     return result
 
-def detect_text_column(columns):
-    preferred_columns = ['review_text', 'tweet', 'text', 'content', 'message', 'body']
-    normalized_columns = {column.lower().strip(): column for column in columns}
-
-    for column in preferred_columns:
-        if column in normalized_columns:
-            return normalized_columns[column]
-
-    for column in columns:
-        normalized = column.lower().strip()
-        if 'tweet' in normalized or 'text' in normalized:
-            return column
-
-    return None
-
 def build_batch_predictions(input_df, text_column, model_data):
+    """Score non-empty rows while preserving the original input columns."""
     output_df = input_df.copy()
     raw_text = output_df[text_column].fillna('').astype(str)
     cleaned_text = raw_text.apply(preprocess_for_prediction)
@@ -386,6 +375,46 @@ def build_batch_predictions(input_df, text_column, model_data):
         output_df.loc[valid_mask, 'positive_probability'] = probabilities[:, 1]
 
     return output_df, valid_mask
+
+def load_batch_input():
+    """Render batch-source controls and return the selected rows."""
+    batch_source = st.radio(
+        "Data source:",
+        ["Upload CSV", "Search public X posts with Xquik"],
+        horizontal=True,
+    )
+    if batch_source == "Upload CSV":
+        uploaded_file = st.file_uploader("Upload CSV file:", type=["csv"])
+        if uploaded_file is None:
+            return None
+        try:
+            return pd.read_csv(uploaded_file)
+        except Exception as exc:
+            st.error(f"Could not read CSV file: {exc}")
+            return None
+
+    st.caption("Xquik API keys are sent only to xquik.com and are not stored by this app.")
+    xquik_query = st.text_input("X search query:", placeholder="product launch lang:en")
+    xquik_api_key = st.text_input("Xquik API key:", type="password")
+    xquik_limit = st.slider("Posts to fetch:", 1, 100, 50)
+    if st.button("Fetch Public X Posts", type="primary"):
+        st.session_state.pop("xquik_batch", None)
+        try:
+            posts = fetch_xquik_posts(xquik_query, xquik_api_key, xquik_limit)
+            st.session_state["xquik_batch"] = {
+                "query": xquik_query.strip(),
+                "posts": posts,
+            }
+        except Exception as exc:
+            st.error(f"Could not fetch X posts: {exc}")
+
+    xquik_batch = st.session_state.get("xquik_batch")
+    if not xquik_batch:
+        return None
+
+    input_df = pd.DataFrame(xquik_batch["posts"])
+    st.caption(f"Loaded {len(input_df)} posts for: {xquik_batch['query']}")
+    return input_df
 
 # ============== Main App ==============
 def main():
@@ -860,7 +889,7 @@ def main():
     # ============== Tab 7: Batch Prediction ==============
     with tab7:
         st.header("Batch Sentiment Prediction", anchor=False)
-        st.markdown("Upload a CSV of tweets or reviews and score every non-empty text row.")
+        st.markdown("Upload a CSV or search public X posts with Xquik, then score every non-empty text row.")
 
         with st.spinner("Loading models..."):
             models = train_models(df)
@@ -870,28 +899,30 @@ def main():
             list(models.keys()),
             key="batch_model_choice"
         )
-        uploaded_file = st.file_uploader("Upload CSV file:", type=["csv"])
+        input_df = load_batch_input()
 
-        if uploaded_file is not None:
-            try:
-                input_df = pd.read_csv(uploaded_file)
-            except Exception as exc:
-                st.error(f"Could not read CSV file: {exc}")
-                input_df = None
-
-            if input_df is not None:
-                if input_df.empty:
-                    st.warning("The uploaded CSV has no rows.")
+        if input_df is not None:
+            if input_df.empty:
+                st.warning("The selected data source has no rows.")
+            else:
+                detected_column = detect_text_column(input_df.columns)
+                column_options = list(input_df.columns)
+                if detected_column is None:
+                    st.warning("No text column was detected. Choose the text column before scoring.")
+                    select_options = [None, *column_options]
+                    text_column = st.selectbox(
+                        "Text column:",
+                        select_options,
+                        format_func=lambda column: "Choose a text column" if column is None else column,
+                    )
                 else:
-                    detected_column = detect_text_column(input_df.columns)
-                    column_options = list(input_df.columns)
-                    default_index = column_options.index(detected_column) if detected_column in column_options else 0
                     text_column = st.selectbox(
                         "Text column:",
                         column_options,
-                        index=default_index
+                        index=column_options.index(detected_column),
                     )
 
+                if text_column is not None:
                     results_df, valid_mask = build_batch_predictions(
                         input_df,
                         text_column,
