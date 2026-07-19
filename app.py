@@ -17,6 +17,9 @@ from sklearn.naive_bayes import MultinomialNB
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_curve, roc_auc_score, f1_score, precision_recall_curve
 from scipy.sparse import hstack
 import warnings
+
+from batch_sources import detect_text_column, fetch_xquik_posts
+
 warnings.filterwarnings('ignore')
 
 # Mathematical formulations as markdown
@@ -344,6 +347,75 @@ def preprocess_for_prediction(text):
     
     return result
 
+def build_batch_predictions(input_df, text_column, model_data):
+    """Score non-empty rows while preserving the original input columns."""
+    output_df = input_df.copy()
+    raw_text = output_df[text_column].fillna('').astype(str)
+    cleaned_text = raw_text.apply(preprocess_for_prediction)
+    valid_mask = cleaned_text.str.len() > 0
+
+    output_df['cleaned_text'] = cleaned_text
+    output_df['predicted_sentiment'] = ''
+
+    if not valid_mask.any():
+        return output_df, valid_mask
+
+    vectorizer = model_data['vectorizer']
+    model = model_data['model']
+    X_batch = vectorizer.transform(cleaned_text[valid_mask])
+    predictions = model.predict(X_batch)
+    output_df.loc[valid_mask, 'predicted_sentiment'] = [
+        'Positive' if prediction == 1 else 'Negative'
+        for prediction in predictions
+    ]
+
+    if hasattr(model, 'predict_proba'):
+        probabilities = model.predict_proba(X_batch)
+        output_df.loc[valid_mask, 'negative_probability'] = probabilities[:, 0]
+        output_df.loc[valid_mask, 'positive_probability'] = probabilities[:, 1]
+
+    return output_df, valid_mask
+
+def load_batch_input():
+    """Render batch-source controls and return the selected rows."""
+    batch_source = st.radio(
+        "Data source:",
+        ["Upload CSV", "Search public X posts with Xquik"],
+        horizontal=True,
+    )
+    if batch_source == "Upload CSV":
+        uploaded_file = st.file_uploader("Upload CSV file:", type=["csv"])
+        if uploaded_file is None:
+            return None
+        try:
+            return pd.read_csv(uploaded_file)
+        except Exception as exc:
+            st.error(f"Could not read CSV file: {exc}")
+            return None
+
+    st.caption("Xquik API keys are sent only to xquik.com and are not stored by this app.")
+    xquik_query = st.text_input("X search query:", placeholder="product launch lang:en")
+    xquik_api_key = st.text_input("Xquik API key:", type="password")
+    xquik_limit = st.slider("Posts to fetch:", 1, 100, 50)
+    if st.button("Fetch Public X Posts", type="primary"):
+        st.session_state.pop("xquik_batch", None)
+        try:
+            posts = fetch_xquik_posts(xquik_query, xquik_api_key, xquik_limit)
+            st.session_state["xquik_batch"] = {
+                "query": xquik_query.strip(),
+                "posts": posts,
+            }
+        except Exception as exc:
+            st.error(f"Could not fetch X posts: {exc}")
+
+    xquik_batch = st.session_state.get("xquik_batch")
+    if not xquik_batch:
+        return None
+
+    input_df = pd.DataFrame(xquik_batch["posts"])
+    st.caption(f"Loaded {len(input_df)} posts for: {xquik_batch['query']}")
+    return input_df
+
 # ============== Main App ==============
 def main():
     # Header
@@ -370,13 +442,14 @@ def main():
         top_n = st.slider("Top N words to display", 10, 30, 20)
     
     # Main tabs
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         ":material/monitoring: Overview", 
         ":material/text_fields: Word Analysis", 
         ":material/smart_toy: Model Comparison", 
         ":material/functions: Math & ROC", 
         ":material/target: Live Prediction", 
-        ":material/table_view: Data Explorer"
+        ":material/table_view: Data Explorer",
+        ":material/upload_file: Batch Prediction"
     ])
     
     # ============== Tab 1: Overview ==============
@@ -812,6 +885,61 @@ def main():
             mime="text/csv",
             icon=":material/download:"
         )
+
+    # ============== Tab 7: Batch Prediction ==============
+    with tab7:
+        st.header("Batch Sentiment Prediction", anchor=False)
+        st.markdown("Upload a CSV or search public X posts with Xquik, then score every non-empty text row.")
+
+        with st.spinner("Loading models..."):
+            models = train_models(df)
+
+        batch_model_choice = st.selectbox(
+            "Select Batch Model:",
+            list(models.keys()),
+            key="batch_model_choice"
+        )
+        input_df = load_batch_input()
+
+        if input_df is not None:
+            if input_df.empty:
+                st.warning("The selected data source has no rows.")
+            else:
+                detected_column = detect_text_column(input_df.columns)
+                column_options = list(input_df.columns)
+                if detected_column is None:
+                    st.warning("No text column was detected. Choose the text column before scoring.")
+                    select_options = [None, *column_options]
+                    text_column = st.selectbox(
+                        "Text column:",
+                        select_options,
+                        format_func=lambda column: "Choose a text column" if column is None else column,
+                    )
+                else:
+                    text_column = st.selectbox(
+                        "Text column:",
+                        column_options,
+                        index=column_options.index(detected_column),
+                    )
+
+                if text_column is not None:
+                    results_df, valid_mask = build_batch_predictions(
+                        input_df,
+                        text_column,
+                        models[batch_model_choice]
+                    )
+
+                    st.metric("Rows Scored", int(valid_mask.sum()))
+                    st.dataframe(results_df, use_container_width=True, hide_index=True)
+
+                    csv_results = results_df.to_csv(index=False)
+                    st.download_button(
+                        label="Download Predictions as CSV",
+                        data=csv_results,
+                        file_name="batch_sentiment_predictions.csv",
+                        mime="text/csv",
+                        icon=":material/download:"
+                    )
 
 if __name__ == "__main__":
     main()
